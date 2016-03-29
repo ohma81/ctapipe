@@ -61,7 +61,7 @@ def dilate(geom, mask):
     pre-computed, e.g. via `tailcuts_clean`.
 
     Modifies mask in-place by default (pass `mask.copy()` if you want
-    to maintain a copy of the undialated data)
+    to maintain a copy of the un-dilated data)
     """
     for pixid in geom.pix_id[mask]:
         mask[geom.neighbors[pixid]] = True

@@ -1,11 +1,13 @@
+import argparse
+
 import pyhessio
 from matplotlib import pyplot as plt
 
 from ctapipe import visualization, io
 from ctapipe.io.hessio import hessio_event_source
-from ctapipe.utils.datasets import get_example_simtelarray_file
 from ctapipe.reco.hillas import hillas_parameters
-from ctapipe.io import CameraGeometry
+from ctapipe.reco.cleaning import tailcuts_clean
+from ctapipe.utils.datasets import get_example_simtelarray_file
 
 """
 Test script for the mono reconstruction
@@ -20,7 +22,7 @@ pytest.
 def get_mc_calibration_coeffs(tel_id):
     """
     Get the calibration coefficients from the MC data file to the
-    data.  This is ahack (until we have a real data structure for the
+    data.  This is a hack (until we have a real data structure for the
     calibrated data), it should move into `ctapipe.io.hessio_event_source`.
 
     returns
@@ -41,15 +43,21 @@ def apply_mc_calibration(adcs, tel_id):
 
 
 if __name__ == '__main__':
-#def test_monoreco():
-    telid = 2
-    maxevents = 1000
-    source = hessio_event_source(get_example_simtelarray_file(),
-                                 allowed_tels=[telid], max_events=maxevents)
+    parser = argparse.ArgumentParser(description='test mono reconstruction')
+    parser.add_argument('telid', metavar='TEL_ID', type=int)
+    parser.add_argument('filename', metavar='EVENTIO_FILE', nargs='?',
+                        default=get_example_simtelarray_file())
+    parser.add_argument('-m', '--max-events', type=int, default=100000)
+    args = parser.parse_args()
+
+    #def test_monoreco():
+    source = hessio_event_source(args.filename,
+                                 allowed_tels=[args.telid, ],
+                                 max_events=args.max_events)
 
     disp = None
 
-    print('SELECTING EVENTS FROM TELESCOPE {}'.format(telid))
+    print('SELECTING EVENTS FROM TELESCOPE {}'.format(args.telid))
 
     for event in source:
 
@@ -59,30 +67,25 @@ if __name__ == '__main__':
         print(event.dl0)
 
         if disp is None:
-            x, y = event.meta.pixel_pos[telid]
-            geom = io.CameraGeometry.guess(x, y)
-            disp = visualization.CameraDisplay(geom, title='CT%d' % telid)
+            x, y = event.meta.pixel_pos[args.telid]
+            geom = io.CameraGeometry.guess(x, y, event.meta.optical_foclen[args.telid])
+            disp = visualization.CameraDisplay(geom, title='CT%d' % args.telid)
             disp.enable_pixel_picker()
             disp.add_colorbar()
             plt.show(block=False)
 
-        # display integrated event:
-        disp.image = apply_mc_calibration(
-            event.dl0.tel[telid].adc_sums[0], telid)
+        # calibrate and display integrated event:
+        image = event.dl0.tel[args.telid].adc_sums[0]
+        image = apply_mc_calibration(image, args.telid)
 
-        image = disp.image.copy()
-
-        disp.set_limits_percent(70)
-        plt.pause(0.1)
-
-        # apply really stupid image cleaning (single threshold):
-        clean = image.copy()
-        clean[image <= 3.0 * image.mean()] = 0.0
-
+        # apply tailcuts cleaning
+        camera_mask = tailcuts_clean(geom, image, 1, 14, 6) # values already in pe
+        image[~camera_mask] = 0
+        disp.image = image
         # calculate image parameters
-        hillas = hillas_parameters(geom.pix_x.value, geom.pix_y.value, clean)
+        hillas = hillas_parameters(geom.pix_x.value, geom.pix_y.value, image)
         print(hillas)
 
         disp.overlay_moments(hillas, color='seagreen', linewidth=3)
 
-        plt.show()
+        plt.pause(0.1)
