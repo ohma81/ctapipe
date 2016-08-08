@@ -1,4 +1,7 @@
-"""Example of extracting a single telescope from a merged/interleaved
+#!/usr/bin/env python3
+
+"""
+Example of extracting a single telescope from a merged/interleaved
 simtelarray data file.
 
 Only events that contain the specified telescope are read and
@@ -6,14 +9,18 @@ displayed. Other telescopes and events are skipped over (EventIO data
 files have no index table in them, so the events must be read in
 sequence to find ones with the appropriate telescope, therefore this
 is not a fast operation)
-
 """
+
 from ctapipe.utils.datasets import get_example_simtelarray_file
 from ctapipe.io.hessio import hessio_event_source
-from ctapipe import visualization, io
+from ctapipe import visualization, io, reco
 from matplotlib import pyplot as plt
+import numpy as np
 from astropy import units as u
 import pyhessio
+from ctapipe.instrument import InstrumentDescription as ID
+from ctapipe.coordinates import CameraFrame, NominalFrame, TelescopeFrame
+import astropy.units as u
 
 import logging
 import argparse
@@ -61,12 +68,16 @@ if __name__ == '__main__':
                         help='show time-variablity, one frame at a time')
     parser.add_argument('--calibrate', action='store_true',
                         help='apply calibration coeffs from MC')
+    parser.add_argument('--hillas', action='store_true',
+                        help='apply hillas parameterization and cleaning')
     args = parser.parse_args()
 
     source = hessio_event_source(args.filename,
                                  allowed_tels=[args.tel, ],
                                  max_events=args.max_events)
     disp = None
+    tel,cam,opt = ID.load(args.filename)
+    print(tel['TelescopeTable_VersionFeb2016'][tel['TelescopeTable_VersionFeb2016']['TelID']==args.tel])
 
     print('SELECTING EVENTS FROM TELESCOPE {}'.format(args.tel))
     print('=' * 70)
@@ -82,8 +93,9 @@ if __name__ == '__main__':
             x, y = event.meta.pixel_pos[args.tel]
             geom = io.CameraGeometry.guess(x, y,
                                            event.meta.optical_foclen[args.tel])
+            print(geom.pix_x)
             disp = visualization.CameraDisplay(geom, title='CT%d' % args.tel)
-            disp.enable_pixel_picker()
+            #disp.enable_pixel_picker()
             disp.add_colorbar()
             plt.show(block=False)
 
@@ -106,11 +118,33 @@ if __name__ == '__main__':
         else:
             # display integrated event:
             im = event.dl0.tel[args.tel].adc_sums[args.channel]
-            if args.calibrate:
-                im = apply_mc_calibration(im, args.tel)
+            im = apply_mc_calibration(im, args.tel)
             disp.image = im
-            disp.set_limits_percent(70)
-            plt.pause(0.1)
+
+            if args.hillas:
+                clean_mask = reco.cleaning.tailcuts_clean(geom,im,1,picture_thresh=10,boundary_thresh=5)
+                camera_coord = CameraFrame(x=x,y=y,z=np.zeros(x.shape)*u.m)
+
+                nom_coord = camera_coord.transform_to(NominalFrame(array_direction=[70*u.deg,0*u.deg],
+                                                           pointing_direction=[70*u.deg,0*u.deg],
+                                                           focal_length=tel['TelescopeTable_VersionFeb2016'][tel['TelescopeTable_VersionFeb2016']['TelID']==args.tel]['FL'][0]*u.m))
+
+                image = np.asanyarray(im * clean_mask, dtype=np.float64)
+
+                nom_x = nom_coord.x
+                nom_y = nom_coord.y
+
+                hillas = reco.hillas_parameters(x,y,im * clean_mask)
+                hillas_nom = reco.hillas_parameters(nom_x,nom_y,im * clean_mask)
+
+                print (hillas)
+                print (hillas_nom)
+
+                disp.image = im * clean_mask
+                disp.overlay_moments(hillas, color='seagreen', linewidth=3)
+                disp.set_limits_percent(70)
+
+            plt.pause(1.0)
             if args.write:
                 plt.savefig('CT{:03d}_EV{:010d}.png'
                             .format(args.tel, event.dl0.event_id))

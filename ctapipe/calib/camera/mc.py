@@ -1,574 +1,265 @@
 """
-Integrate sample-mode data (traces) Functions
-and
-Convert the integral pixel ADC count to photo-electrons
-"""
+Calibration for MC (simtelarray) files.
 
-import sys
-import numpy as np
-from numpy import round
-from pyhessio import *
-from ctapipe import io
-from astropy import units as u
-import logging
-logger = logging.getLogger(__name__)
-
-__all__ = [
-    'set_integration_correction',
-    'pixel_integration_mc',
-    'full_integration_mc',
-    'simple_integration_mc',
-    'global_peak_integration_mc',
-    'local_peak_integration_mc',
-    'nb_peak_integration_mc',
-    'calibrate_amplitude_mc',
-]
-
-CALIB_SCALE = 0.92
-
-"""
-
-The function in this module are the same to their corresponding ones in
+The interpolation of the pulse shape and the adc2pe conversion in this module
+are the same to their corresponding ones in
 - read_hess.c
 - reconstruct.c
-in hessioxxx software package, just in some caes the suffix "_mc" has
-been added here to the original name function.
+in hessioxxx software package.
 
 Note: Input MC version = prod2. For future MC versions the calibration
 function might be different for each camera type.
-It has not been tested so far.
-
-In general the integration functions corresponds one to one in name and
-functionality with those in hessioxxx package.
-The same the interpolation of the pulse shape and the adc2pe conversion.
-
 """
 
+import numpy as np
+from ctapipe.io import CameraGeometry
+import logging
+from scipy import interp
+from .integrators import integrator_switch, integrators_requiring_geom, \
+    integrator_dict
 
-def qpol(x, np, yval):
-    ix = round(x)
-    if x < 0 or x >= float(np):
-        return 0.
-    if ix+1 >= np:
-        return 0.
-    return yval[ix]*(ix+1-x) + yval[ix-1]*(x-ix)
+logger = logging.getLogger(__name__)
 
 
-def set_integration_correction(telid, params):
+def set_integration_correction(event, telid, params):
     """
-    Parameters
+    Obtain the integration correction for the window specified
+
+        Parameters
     ----------
-    event  Data set container to the hess_io event ()
-    telid  Telescope_id
-    nbins
-    parameters['nskip']  Number of initial samples skipped
-    (adapted such that interval fits into what is available).
-    Returns
-    -------
-    Array of gains with the integration correction [ADC cts]
-    Returns None if parameters do not include 'nskip'
-    """
-    if 'nskip' not in params or 'nsum' not in params:
-        return None
+    event : container
+        A `ctapipe` event container
+    telid : int
+        telescope id
+    params : dict
+        REQUIRED:
 
-    integration_correction = []
-    for igain in range(0, get_num_channel(telid)):
-        refshape = get_ref_shapes(telid, igain)
-        int_corr = 1.0
-        # Sum over all the pulse we have and rescale to original time step
-        asum = sum(refshape)*get_ref_step(telid)/get_time_slice(telid)
-        # Find the pulse shape peak (bin and value)
-        speak = max(refshape)
-        ipeak = refshape.argmax(axis=0)
-        # Sum up given interval starting from peak, averaging over phase
-        around_peak_sum = 0
-        for iphase in range(0, 5):
-            ti = (((iphase*0.2-0.4) - params['nskip']) *
-            get_time_slice(telid)/get_ref_step(telid) + ipeak)
-            for ibin in range(0, params['nsum']):
-                around_peak_sum += qpol(
-                    ibin*get_time_slice(telid)/get_ref_step(telid) +
-                    ti, get_lrefshape(telid), refshape)
-        around_peak_sum *= 0.2
-        if around_peak_sum > 0. and asum > 0.:
-            int_corr = asum/around_peak_sum
+        params['window'] - Integration window size
 
-        integration_correction.append(int_corr)
+        params['shift'] - Starting sample for this integration
 
-    return integration_correction
-
-
-def pixel_integration_mc(event, ped, telid, parameters):
-    """
-    Parameters
-    ----------
-    event  Data set container to the hess_io event ()
-    ped    Array of double containing the pedestal
-    telid  Telescope_id
-    parameters
-    integrator: pixel integration algorithm
-       -"full_integration": full digitized range integrated amplitude-pedestal
-       -"simple_integration": fixed integration region (window)
-       -"global_peak_integration": integration region by global
-       peak of significant pixels
-       -"local_peak_integration": peak in each pixel determined independently
-       -"nb_peak_integration":
+        (adapted such that window fits into readout).
 
     Returns
     -------
-    Array of pixels with integrated change [ADC cts], pedestal substracted.
-    Returns None if event is None
+    correction : float
+        Value of the integration correction for this instrument \n
     """
-    if __debug__:
-        logger.debug("> %s"%(parameters['integrator']))
-    if event is None:
-        return None
 
-    switch = {
-        'full_integration': lambda: full_integration_mc(event, ped, telid),
-        'simple_integration': lambda: simple_integration_mc(
-            event, ped, telid, parameters),
-        'global_peak_integration': lambda: global_peak_integration_mc(
-            event, ped, telid, parameters),
-        'local_peak_integration': lambda: local_peak_integration_mc(
-            event, ped, telid, parameters),
-        'nb_peak_integration': lambda: nb_peak_integration_mc(
-            event, ped, telid, parameters),
-        }
     try:
-        result = switch[parameters['integrator']]()
+        if 'window' not in params or 'shift' not in params:
+            raise KeyError()
     except KeyError:
-        result = switch[None]()
+        logger.exception("[ERROR] missing required params")
 
-    return result
+    nchan = event.dl0.tel[telid].num_channels
+    nsamples = event.dl0.tel[telid].num_samples
+
+    # Reference pulse parameters
+    refshapes = np.array(list(event.mc.tel[telid].refshapes.values()))
+    refstep = event.mc.tel[telid].refstep
+    nrefstep = event.mc.tel[telid].lrefshape
+    x = np.arange(0, refstep*nrefstep, refstep)
+    y = refshapes[nchan-1]
+    refipeak = np.argmax(y)
+
+    # Sampling pulse parameters
+    time_slice = event.mc.tel[telid].time_slice
+    x1 = np.arange(0, refstep*nrefstep, time_slice)
+    y1 = interp(x1, x, y)
+    ipeak = np.argmin(np.abs(x1-x[refipeak]))
+
+    # Check window is within readout
+    start = ipeak - params['shift']
+    window = params['window']
+    if window > nsamples:
+        window = nsamples
+    if start < 0:
+        start = 0
+    if start + window > nsamples:
+        start = nsamples - window
+
+    correction = round((sum(y) * refstep) / (sum(y1[start:start + window]) *
+                                             time_slice), 7)
+
+    return correction
 
 
-def full_integration_mc(event, ped, telid):
-
+def calibrate_amplitude_mc(event, charge, telid, params):
     """
-    Use full digitized range for the integration amplitude
-    algorithm (sum - pedestal)
-
-    No weighting of individual samples is applied.
+    Convert charge from ADC counts to photo-electrons
 
     Parameters
     ----------
+    event : container
+        A `ctapipe` event container
+    charge : ndarray
+        array of pixels with integrated charge [ADC counts]
+        (pedestal substracted)
+    telid : int
+        telescope id
+    params : dict
+        OPTIONAL:
 
-    event  Data set container to the hess_io event ()
-    ped    Array of double containing the pedestal
-    telid  Telescope_id
+        params['clip_amp'] - Amplitude in p.e. above which the signal is
+        clipped.
+
+        params['calib_scale'] : Identical to global variable CALIB_SCALE in
+        reconstruct.c in hessioxxx software package. 0.92 is the default value
+        (corresponds to HESS). The required value changes between cameras
+        (GCT = 1.05).
 
     Returns
     -------
-    array of pixels with integrated change [ADC cts], pedestal
-    substracted per gain
-
+    pe : ndarray
+        array of pixels with integrated charge [photo-electrons]
+        (pedestal substracted)
     """
 
-    if event is None or telid < 0:
-        return None
+    calib = event.dl0.tel[telid].calibration
 
-    sum_pix_tel = []
-    for igain in range(0, get_num_channel(telid)):
-        sum_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            samples_pix = np.asarray(get_adc_sample(telid, igain)[ipix])
-            sum_pix.append(sum(samples_pix[:])-ped[igain][ipix])
-        sum_pix_tel.append(sum_pix)
+    pe = charge * calib
+    # TODO: add clever calib for prod3 and LG channel
 
-    return np.asarray(sum_pix_tel), None
+    if "climp_amp" in params and params["clip_amp"] > 0:
+        pe[np.where(pe > params["clip_amp"])] = params["clip_amp"]
+    if "calib_scale" not in params:
+        # Store default value into mutable dict, so it is preserved
+        params["calib_scale"] = 0.92  # Correct value for HESS
+    calib_scale = params["calib_scale"]
 
-
-def simple_integration_mc(event, ped, telid, parameters):
     """
-    Integrate sample-mode data (traces) over a common and fixed interval.
+    pe_pix is in units of 'mean photo-electrons'
+    (unit = mean p.e. signal.).
+    We convert to experimentalist's 'peak photo-electrons'
+    now (unit = most probable p.e. signal after experimental resolution).
+    Keep in mind: peak(10 p.e.) != 10*peak(1 p.e.)
+    """
+    scaled_pe = pe * calib_scale
+    # TODO: create dict of CALIB_SCALE for every instrument
 
-    The integration window can be anywhere in the available length of
-    the traces.
-    Since the calibration function subtracts a pedestal that corresponds to the
-    total length of the traces we may also have to add a pedestal contribution
-    for the samples not summed up.
-    No weighting of individual samples is applied.
+    return scaled_pe
+
+
+def integration_mc(event, telid, params, geom=None):
+    """
+    Generic integrator for mc files. Calls the integrator_switch for actual
+    integration. Subtracts the pedestal and applies the integration correction.
 
     Parameters
     ----------
+    event : container
+        A `ctapipe` event container
+    telid : int
+        telescope id
+    params : dict
+        REQUIRED:
 
-    event  Data set container to the hess_io event ()
-    ped    Array of double containing the pedestal
-    telid  Telescope_id
-    parameters['nsum']   Number of samples to sum up (is reduced if
-                         exceeding available length).
-    parameters['nskip']  Number of initial samples skipped (adapted such that
-                         interval fits into what is available).
-    Note: for multiple gains, this results in identical integration regions.
+        params['integrator'] - Integration scheme
+
+        params['window'] - Integration window size
+
+        params['shift'] - Starting sample for this integration
+
+        (adapted such that window fits into readout).
+
+        OPTIONAL:
+
+        params['sigamp'] - Amplitude in ADC counts above pedestal at which a
+        signal is considered as significant (separate for high gain/low gain).
+    geom : `ctapipe.io.CameraGeometry`
+        geometry of the camera's pixels. Leave as None for automatic
+        calculation when it is required.
 
     Returns
     -------
-    array of pixels with integrated change [ADC cts], pedestal
-    substracted per gain
+    charge : ndarray
+        array of pixels with integrated charge [ADC counts]
+        (pedestal substracted)
+    integration_window : ndarray
+        bool array of same shape as data. Specified which samples are included
+        in the integration window
+    data_ped : ndarray
+        pedestal subtracted data
     """
 
-    if event is None or telid < 0:
-        return None
-    nsum = parameters['nsum']
-    nskip = parameters['nskip']
+    # Obtain the data
+    nsamples = event.dl0.tel[telid].num_samples
+    data = np.array(list(event.dl0.tel[telid].adc_samples.values()))
+    ped = event.dl0.tel[telid].pedestal
+    data_ped = data - np.atleast_3d(ped/nsamples)
+    int_dict, inverted = integrator_dict()
+    if geom is None and inverted[params['integrator']] in \
+            integrators_requiring_geom():
+        geom = CameraGeometry.guess(*event.meta.pixel_pos[telid],
+                                    event.meta.optical_foclen[telid])
 
-    # Sanity check on the 'nsum' and 'nskip' parameters given by the "user"
-    if (nsum + nskip) > get_num_samples(telid):
-        # the number of sample to sum up can not be larger than the actual
-        # number of samples of the pixel.
-        # If so, the number to sum up is the actual number of samples.
-        # the number of samples to skip is calculated again depending on
-        # the actual number of samples of the pixel
-        if nsum >= get_num_samples(telid):
-            nsum = get_num_samples(telid)
-            nskip = 0
-        else:
-            nskip = get_num_samples(telid)-nsum
+    # Integrate
+    integration, integration_window = integrator_switch(data_ped, geom, params)
 
-    sum_pix_tel = []
-    int_corr = np.array([1.]*get_num_channel(telid))
-    for igain in range(0, get_num_channel(telid)):
-        sum_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            samples_pix_win = (get_adc_sample(telid, igain)[ipix]
-            [nskip:(nsum+nskip)])
-            ped_per_trace = ped[igain][ipix]/get_num_samples(telid)
-            sum_pix.append(int(int_corr[igain]*(sum(samples_pix_win) - 
-                                                ped_per_trace*nsum)+0.5))
-        sum_pix_tel.append(sum_pix)
+    # Get the integration correction
+    int_corr = set_integration_correction(event, telid, params)
+    window = sum(integration_window[0][0])
+    if window == nsamples:
+        int_corr = 1
 
-    return np.asarray(sum_pix_tel), None
+    # Convert integration into charge
+    charge = np.round(integration * int_corr)
+
+    return charge, integration_window, data_ped
 
 
-def global_peak_integration_mc(event, ped, telid, parameters):
+def calibrate_mc(event, telid, params, geom=None):
     """
-    Integrate sample-mode data (traces) over a common interval around a
-    global signal peak.
-
-    The integration window can be anywhere in the available length of the
-    traces.
-    No weighting of individual samples is applied.
+    Generic calibrator for mc files. Calls the itegrator function to obtain
+    the ADC charge, then calibrates that into photo-electrons.
 
     Parameters
     ----------
+    event : container
+        A `ctapipe` event container
+    telid : int
+        telescope id
+    params : dict
+        REQUIRED:
 
-    event  Data set container to the hess_io event ()
-    ped    Array of double containing the pedestal
-    telid  Telescope_id
-    parameters['nsum']    Number of samples to sum up (is reduced if
-    exceeding available length).
-    parameters['nskip'] Start the integration a number of samples before
-    the peak, as long as it fits into the available data range.
-    Note: for multiple gains, this results in identical integration regions.
-    parameters['sigamp']  Amplitude in ADC counts above pedestal at which a
-    signal is considered as significant (separate for high gain/low gain).
+        params['integrator'] - Integration scheme
+
+        params['window'] - Integration window size
+
+        params['shift'] - Starting sample for this integration
+
+        (adapted such that window fits into readout).
+
+        OPTIONAL:
+
+        params['clip_amp'] - Amplitude in p.e. above which the signal is
+        clipped.
+
+        params['calib_scale'] : Identical to global variable CALIB_SCALE in
+        reconstruct.c in hessioxxx software package. 0.92 is the default value
+        (corresponds to HESS). The required value changes between cameras
+        (GCT = 1.05).
+
+        params['sigamp'] - Amplitude in ADC counts above pedestal at which a
+        signal is considered as significant (separate for high gain/low gain).
+    geom : `ctapipe.io.CameraGeometry`
+        geometry of the camera's pixels. Leave as None for automatic
+        calculation when it is required.
 
     Returns
     -------
-    array of pixels with integrated change [ADC cts], pedestal
-    substracted per gain and peak slide
+    pe : ndarray
+        array of pixels with integrated charge [photo-electrons]
+        (pedestal substracted)
+    window : ndarray
+        bool array of same shape as data. Specified which samples are included
+        in the integration window
+    data_ped : ndarray
+        pedestal subtracted data
     """
 
-    # The number of samples to sum up can not be larger than the
-    # number of samples
-    nsum = parameters['nsum']
-    if nsum >= get_num_samples(telid):
-        nsum = get_num_samples(telid)
+    charge, window, data_ped = integration_mc(event, telid, params, geom)
+    pe = calibrate_amplitude_mc(event, charge, telid, params)
 
-    sum_pix_tel = []
-    time_pix_tel = []
-    jpeak = []
-    ppeak = []
-    for igain in range(0, get_num_channel(telid)):
-        peakpos = 0
-        npeaks = 0
-        # Find the peak (peakpos)
-        peak_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            ped_per_trace = int(ped[igain][ipix]/get_num_samples(telid)+0.5)
-            samples_pix_clean = np.asarray(get_adc_sample(telid, igain)
-            [ipix]).astype(np.int16) - ped_per_trace
-            significant = 0
-            ipeak = -1
-            for isamp in range(0, get_num_samples(telid)):
-                if samples_pix_clean[isamp] >= parameters['sigamp'][igain]:
-                    significant = 1
-                    ipeak = isamp
-                    for isamp2 in range(isamp+1, get_num_samples(telid)):
-                        if (samples_pix_clean[isamp2] >
-                        samples_pix_clean[ipeak]):
-                            ipeak = isamp2
-                    break
-
-            if significant == 1:
-                jpeak.append(ipeak)
-                ppeak.append(samples_pix_clean[ipeak])
-                npeaks += 1
-                peak_pix.append(ipeak)
-
-        peakpos = 0
-        if npeaks > 0 and sum(jpeak) > 0.:
-            peakpos = sum(np.array(jpeak)*np.array(ppeak))/sum(np.array(ppeak))
-
-        # Sanitity check
-        start = round(peakpos) - parameters['nskip']
-        if start < 0:
-            start = 0
-        if start + nsum > get_num_samples(telid):
-            start = get_num_samples(telid) - nsum
-
-        int_corr = set_integration_correction(telid, parameters)
-        # Integrate pixel
-        sum_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            samples_pix_win = np.asarray(get_adc_sample(telid, igain)
-            [ipix])[start:(nsum+start)]
-            ped_per_trace = ped[igain][ipix]/get_num_samples(telid)
-            sum_pix.append(round(int_corr[igain] *
-                                 (sum(samples_pix_win) - ped_per_trace*nsum)))
-
-        sum_pix_tel.append(sum_pix)
-        time_pix_tel.append(peak_pix)
-    return np.asarray(sum_pix_tel), np.asarray(time_pix_tel)
-
-
-def local_peak_integration_mc(event, ped, telid, parameters):
-    """
-    Integrate sample-mode data (traces) around a pixel-local signal peak.
-
-    The integration window can be anywhere in the available
-    length of the traces.
-    No weighting of individual samples is applied.
-
-    Parameters
-    ----------
-
-    event  Data set container to the hess_io event ()
-    ped    Array of double containing the pedestal
-    telid  Telescope_id
-    parameters['nsum']    Number of samples to sum up (is reduced if
-                          exceeding available length).
-    parameters['nskip'] Start the integration a number of samples before
-                        the peak, as long as it fits into the available
-                        data range.
-    Note: for multiple gains, this results in identical integration regions.
-    parameters['sigamp']  Amplitude in ADC counts above pedestal at which a
-                          signal is considered as significant (separate for
-                          high gain/low gain).
-
-    Returns
-    -------
-    array of pixels with integrated change [ADC cts], pedestal
-    substracted per gain and peak slide
-    """
-
-    # The number of samples to sum up can not be larger than
-    # the number of samples
-    nsum = parameters['nsum']
-    if nsum >= get_num_samples(telid):
-        nsum = get_num_samples(telid)
-
-    sum_pix_tel = []
-    time_pix_tel = []
-    peakpos = []  # [igain][ipix] (def. io_hess.h: 0=HI_GAIN,1=LO_GAIN)
-    for igain in range(0, get_num_channel(telid)):
-        jpeak = []  # [ipix] local peak for each pixel
-        sum_pix = []
-        peak_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            # Find the peak (peakpos)
-            ped_per_trace = int(ped[igain][ipix]/get_num_samples(telid)+0.5)
-            samples_pix_clean = np.asarray(get_adc_sample(telid, igain)
-            [ipix]).astype(np.int16) - ped_per_trace
-            significant = 0
-            ipeak = -1
-            for isamp in range(0, get_num_samples(telid)):
-                if samples_pix_clean[isamp] >= parameters['sigamp'][igain]:
-                    significant = 1
-                    ipeak = isamp
-                    for isamp2 in range(isamp+1, get_num_samples(telid)):
-                        if (samples_pix_clean[isamp2] >
-                        samples_pix_clean[ipeak]):
-                            ipeak = isamp2
-                    break
-            peak_pix.append(ipeak)
-            if igain == 0:
-                jpeak.append(ipeak)
-            else:
-                # If the LG is not significant, takes the HG peakpos
-                if significant and ipeak >= 0:
-                    jpeak.append(ipeak)
-                else:
-                    jpeak.append(peakpos[0][ipix])
-
-            # Sanitity check
-            start = round(jpeak[ipix]) - parameters['nskip']
-            if start < 0:
-                start = 0
-            if start + nsum > get_num_samples(telid):
-                start = get_num_samples(telid) - nsum
-
-            int_corr = set_integration_correction(telid, parameters)
-            # Integrate pixel
-            samples_pix_win = np.asarray(get_adc_sample(telid, igain)
-            [ipix])[start:(nsum+start)]
-            ped_per_trace = ped[igain][ipix]/get_num_samples(telid)
-            if jpeak[ipix] > 0:
-                sum_pix.append(round(int_corr[igain] *
-                                     (sum(samples_pix_win) -
-                                      ped_per_trace*nsum)))
-            else:
-                sum_pix.append(0.)
-
-        # Save the peak positions for LG check
-        peakpos.append(jpeak)
-
-        sum_pix_tel.append(sum_pix)
-        time_pix_tel.append(peak_pix)
-    return np.asarray(sum_pix_tel), np.asarray(time_pix_tel)
-
-
-def nb_peak_integration_mc(event, ped, telid, parameters):
-    """
-    Integrate sample-mode data (traces) around a peak in the signal sum of
-    neighbouring pixels.
-
-    The integration window can be anywhere in the available length
-    of the traces.
-    No weighting of individual samples is applied.
-
-    Parameters
-    ----------
-
-    event                 Data set container to the hess_io event ()
-    ped                   Array of double containing the pedestal
-    telid                 Telescope_id
-    parameters['nsum']    Number of samples to sum up
-                          (is reduced if exceeding available length).
-    parameters['nskip'] Start the integration a number of samples before
-                          the peak, as long as it fits into the available data
-                          range.
-                          Note: for multiple gains, this results in identical
-                          integration regions.
-    parameters['sigamp']  Amplitude in ADC counts above pedestal at which
-                          a signal is considered as significant (separate for
-                          high gain/low gain).
-    parameters['lwt']     Weight of the local pixel (0: peak from neighbours
-                          only,1: local pixel counts as much as any neighbour).
-
-    Returns
-    -------
-    array of pixels with integrated change [ADC cts], pedestal
-    substracted per gain and peak slide
-    """
-
-    # The number of samples to sum up can not be larger than
-    # the number of samples
-    nsum = parameters['nsum']
-    if nsum >= get_num_samples(telid):
-        nsum = get_num_samples(telid)
-
-    #  For this integration scheme we need the list of neighbours early on
-    pix_x, pix_y = event.meta.pixel_pos[telid]
-    geom = io.CameraGeometry.guess(pix_x, pix_y)
-
-    sum_pix_tel = []
-    time_pix_tel = []
-    for igain in range(0, get_num_channel(telid)):
-        sum_pix = []
-        peak_pix = []
-        for ipix in range(0, get_num_pixels(telid)):
-            i = 0
-            knb = 0
-            # Loop over the neighbors of ipix
-            ipix_nb = geom.neighbors[ipix]
-            nb_samples = [0 for ii in range(get_num_samples(telid))]
-            for inb in range(len(ipix_nb)):
-                nb_samples += np.array(get_adc_sample(telid, igain)
-                                       [ipix_nb[inb]])
-                knb += 1
-            if parameters['lwt'] > 0:
-                for isamp in range(1, get_num_samples(telid)):
-                    nb_samples += np.array(get_adc_sample(telid, igain)
-                                           [ipix])*lwt
-                knb += 1
-
-            if knb == 0:
-                continue
-            ipeak = 0
-            p = nb_samples[0]
-            for isamp in range(1, get_num_samples(telid)):
-                if nb_samples[isamp] > p:
-                    p = nb_samples[isamp]
-                    ipeak = isamp
-            peakpos = peakpos_hg = ipeak
-            start = peakpos - parameters['nskip']
-
-            # Sanitity check?
-            if start < 0:
-                start = 0
-            if start + nsum > get_num_samples(telid):
-                start = get_num_samples(telid) - nsum
-
-            int_corr = set_integration_correction(telid, parameters)
-            # Integrate pixel
-            samples_pix_win = np.asarray(get_adc_sample(telid, igain)
-            [ipix])[start:(nsum+start)]
-            ped_per_trace = ped[igain][ipix]/get_num_samples(telid)
-            sum_pix.append(round(int_corr[igain]*(sum(samples_pix_win) -
-                                                  ped_per_trace*nsum)))
-            peak_pix.append(peakpos)
-
-        sum_pix_tel.append(sum_pix)
-        time_pix_tel.append(peak_pix)
-
-    return np.asarray(sum_pix_tel), np.asarray(time_pix_tel)
-
-
-def calibrate_amplitude_mc(integrated_charge, calib, telid, params):
-    """
-    Parameters
-    ----------
-    integrated_charge     Array of pixels with integrated change [ADC cts],
-                          pedestal substracted
-    calib                 Array of double containing the single-pe events
-    parameters['clip_amp']  Amplitude in p.e. above which the signal is
-                            clipped.
-    Returns
-    ------
-    Array of pixels with calibrate charge [photo-electrons]
-    Returns None if event is None
-
-    """
-
-    if integrated_charge is None:
-        return None
-
-    pe_pix_tel = []
-    for ipix in range(0, get_num_pixels(telid)):
-        pe_pix = 0
-        int_pix_hg = integrated_charge[get_num_channel(telid)-1][ipix]
-        # If the integral charge is between -300,2000 ADC cts, we choose the HG
-        # Otherwise the LG channel
-        # If there is only one gain, it is the HG (default)
-        if (int_pix_hg > -1000 and int_pix_hg < 10000 or
-        get_num_channel(telid) < 2):
-            pe_pix = (integrated_charge[get_num_channel(telid)-1][ipix] *
-            calib[get_num_channel(telid)-1][ipix])
-        else:
-            pe_pix = (integrated_charge[get_num_channel(telid)][ipix] *
-            calib[get_num_channel(telid)][ipix])
-
-        if "climp_amp" in params and params["clip_amp"] > 0:
-            if pe_pix > params["clip_amp"]:
-                pe_pix = params["clip_amp"]
-
-        # pe_pix is in units of 'mean photo-electrons'
-        # (unit = mean p.e. signal.).
-        # We convert to experimentalist's 'peak photo-electrons'
-        # now (unit = most probable p.e. signal after experimental resolution).
-        # Keep in mind: peak(10 p.e.) != 10*peak(1 p.e.)
-        pe_pix_tel.append(pe_pix*CALIB_SCALE)
-
-    return np.asarray(pe_pix_tel)
+    return pe, window, data_ped
